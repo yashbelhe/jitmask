@@ -92,16 +92,8 @@ class LabelEmbedder(nn.Module):
 
 
 def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
-
-    with torch.cuda.amp.autocast(enabled=False):
-        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
+    # Use PyTorch's native SDPA which dispatches to FlashAttention-2 when available
+    return F.scaled_dot_product_attention(query, key, value, dropout_p=dropout_p)
 
 
 class Attention(nn.Module):
@@ -180,6 +172,106 @@ class FinalLayer(nn.Module):
         return x
 
 
+class PixelBlock(nn.Module):
+    """
+    Pixel Transformer Block from PixelDiT (https://arxiv.org/abs/2511.20645) Section 3.2.
+    Full block: MHSA + FFN, both with pixel-wise adaLN modulation.
+    Includes Pixel Token Compaction (PTC) for efficient attention.
+
+    Key design (from paper):
+    - γ, β = Linear(S_j)  -- direct linear from patch semantic tokens per block
+    - Projection at patch level, then broadcast to all P² pixels per patch
+    - PTC: group r consecutive pixel tokens → compress → attention → decompress
+    - Zero-init on adaLN for identity mapping at start
+    """
+    def __init__(self, pixel_dim, semantic_dim, num_heads, patch_size, ptc_rate=16):
+        super().__init__()
+        self.pixel_dim = pixel_dim
+        self.patch_size = patch_size
+        self.ptc_rate = ptc_rate
+        self.num_heads = num_heads
+        head_dim = pixel_dim // num_heads
+
+        # Pixel-wise adaLN: 6 params for attn + FFN sub-layers
+        # Direct Linear from semantic tokens, projected at patch level
+        self.adaLN_proj = nn.Linear(semantic_dim, 6 * pixel_dim, bias=True)
+
+        # Norms for attention and FFN sub-layers
+        self.norm1 = RMSNorm(pixel_dim)
+        self.norm2 = RMSNorm(pixel_dim)
+
+        # PTC (Pixel Token Compaction, Sec 3.2)
+        self.ptc_compress = nn.Linear(ptc_rate * pixel_dim, pixel_dim)
+        self.ptc_decompress = nn.Linear(pixel_dim, ptc_rate * pixel_dim)
+
+        # Self-attention (on compacted tokens)
+        self.qkv = nn.Linear(pixel_dim, 3 * pixel_dim, bias=True)
+        self.q_norm = RMSNorm(head_dim)
+        self.k_norm = RMSNorm(head_dim)
+        self.attn_proj = nn.Linear(pixel_dim, pixel_dim)
+
+        # FFN
+        mlp_hidden = pixel_dim * 4
+        self.ffn = nn.Sequential(
+            nn.Linear(pixel_dim, mlp_hidden),
+            nn.GELU(approximate='tanh'),
+            nn.Linear(mlp_hidden, pixel_dim),
+        )
+
+    def forward(self, x, semantic_tokens, hint_mod):
+        """
+        x:                (N, T*P², pixel_dim) - pixel tokens
+        semantic_tokens:  (N, T, semantic_dim) - patch-level semantic tokens
+        hint_mod:         (N, T*P², 6*pixel_dim) - per-pixel hint modulation
+        """
+        P2 = self.patch_size ** 2
+        r = self.ptc_rate
+        D = self.pixel_dim
+        N = x.shape[0]
+        T = semantic_tokens.shape[1]
+
+        # Pixel-wise adaLN from semantic tokens (project at patch level, broadcast)
+        sem_mod = self.adaLN_proj(semantic_tokens)                       # (N, T, 6*D)
+        sem_mod = sem_mod.unsqueeze(2).expand(-1, -1, P2, -1)           # (N, T, P², 6*D)
+        sem_mod = sem_mod.reshape(N, T * P2, 6 * D)                     # (N, T*P², 6*D)
+        mod = sem_mod + hint_mod
+        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = mod.chunk(6, dim=-1)
+
+        # === Attention sub-block ===
+        h = self.norm1(x) * (1 + scale_a) + shift_a                     # (N, T*P², D)
+
+        # PTC compress: group r consecutive pixel tokens per patch
+        h = h.reshape(N, T, P2 // r, r, D)                              # (N, T, P²/r, r, D)
+        h = h.reshape(N, T, P2 // r, r * D)                             # (N, T, P²/r, r*D)
+        h = self.ptc_compress(h)                                         # (N, T, P²/r, D)
+        h = h.reshape(N, T * (P2 // r), D)                              # (N, L_c, D)
+
+        # Multi-head self-attention on compacted tokens
+        B, S, C = h.shape
+        qkv = self.qkv(h).reshape(B, S, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+        h = F.scaled_dot_product_attention(q, k, v)
+        h = h.transpose(1, 2).reshape(B, S, C)
+        h = self.attn_proj(h)
+
+        # PTC decompress
+        h = h.reshape(N, T, P2 // r, D)
+        h = self.ptc_decompress(h)                                       # (N, T, P²/r, r*D)
+        h = h.reshape(N, T, P2 // r, r, D)
+        h = h.reshape(N, T * P2, D)                                     # (N, T*P², D)
+
+        x = x + gate_a * h
+
+        # === FFN sub-block ===
+        h = self.norm2(x) * (1 + scale_f) + shift_f
+        h = self.ffn(h)
+        x = x + gate_f * h
+
+        return x
+
+
 class JiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
@@ -220,7 +312,11 @@ class JiT(nn.Module):
         num_classes=1000,
         bottleneck_dim=128,
         in_context_len=32,
-        in_context_start=8
+        in_context_start=8,
+        pixel_hidden_dim=16,
+        num_pixel_blocks=3,
+        pixel_num_heads=4,
+        ptc_rate=16,
     ):
         super().__init__()
         self.in_channels = in_channels
@@ -271,8 +367,25 @@ class JiT(nn.Module):
             for i in range(depth)
         ])
 
-        # linear predict
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        # Pixel-level refinement (PixelDiT-style, Sec 3.2)
+        self.pixel_hidden_dim = pixel_hidden_dim
+
+        self.pixel_embed = nn.Linear(in_channels, pixel_hidden_dim)
+
+        # Hint conditioning
+        self.hint_mlp = nn.Sequential(
+            nn.Linear(in_channels + 1, pixel_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(pixel_hidden_dim, pixel_hidden_dim),
+        )
+        self.hint_mod = nn.Linear(pixel_hidden_dim, 6 * pixel_hidden_dim, bias=True)
+
+        self.pixel_blocks = nn.ModuleList([
+            PixelBlock(pixel_hidden_dim, hidden_size, pixel_num_heads, patch_size, ptc_rate)
+            for _ in range(num_pixel_blocks)
+        ])
+        self.pixel_norm_out = RMSNorm(pixel_hidden_dim)
+        self.pixel_out = nn.Linear(pixel_hidden_dim, in_channels)
 
         self.initialize_weights()
 
@@ -307,12 +420,34 @@ class JiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        # Zero-out hint MLP last layer and hint modulation (hint starts as no-op):
+        nn.init.constant_(self.hint_mlp[-1].weight, 0)
+        nn.init.constant_(self.hint_mlp[-1].bias, 0)
+        nn.init.constant_(self.hint_mod.weight, 0)
+        nn.init.constant_(self.hint_mod.bias, 0)
 
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
+        # Zero-out pixel block adaLN projections (PixelDiT: each block's semantic projection):
+        for block in self.pixel_blocks:
+            nn.init.constant_(block.adaLN_proj.weight, 0)
+            nn.init.constant_(block.adaLN_proj.bias, 0)
+
+        # Zero-out pixel output layer:
+        nn.init.constant_(self.pixel_out.weight, 0)
+        nn.init.constant_(self.pixel_out.bias, 0)
+
+    def patchify_to_pixels(self, imgs):
+        """
+        Patchify image to per-pixel tokens (inverse of unpatchify).
+        imgs: (N, C, H, W)
+        returns: (N, T*P*P, C) where T = (H/P)*(W/P)
+        """
+        N, C, H, W = imgs.shape
+        p = self.patch_size
+        h, w = H // p, W // p
+        x = imgs.reshape(N, C, h, p, w, p)
+        x = x.permute(0, 2, 4, 3, 5, 1)  # (N, h, w, p, p, C)
+        x = x.reshape(N, h * w * p * p, C)
+        return x
 
     def unpatchify(self, x, p):
         """
@@ -328,18 +463,23 @@ class JiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, gt_pixels=None, hint_mask=None):
         """
-        x: (N, C, H, W)
+        x: (N, C, H, W) - noised image
         t: (N,)
         y: (N,)
+        gt_pixels: (N, T*P*P, C) - patchified ground truth pixels (optional, training only)
+        hint_mask: (N, T*P*P, 1) - binary mask for GT pixel hints (optional, training only)
         """
+        # Save noised input for pixel-level blocks (before x_embedder consumes it)
+        x_noised = x
+
         # class and time embeddings
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y)
         c = t_emb + y_emb
 
-        # forward JiT
+        # forward JiT patch-level backbone
         x = self.x_embedder(x)
         x += self.pos_embed
 
@@ -352,9 +492,33 @@ class JiT(nn.Module):
             x = block(x, c, self.feat_rope if i < self.in_context_start else self.feat_rope_incontext)
 
         x = x[:, self.in_context_len:]
+        # x: (N, T, hidden_size) - patch semantic tokens
 
-        x = self.final_layer(x, c)
-        output = self.unpatchify(x, self.patch_size)
+        N, T, _ = x.shape
+        P2 = self.patch_size * self.patch_size
+
+        # GT hint conditioning (all-masked during inference)
+        if gt_pixels is None:
+            gt_pixels = torch.zeros(N, T * P2, self.in_channels, device=x.device, dtype=x.dtype)
+        if hint_mask is None:
+            hint_mask = torch.zeros(N, T * P2, 1, device=x.device, dtype=x.dtype)
+        hint_input = torch.cat([gt_pixels * hint_mask, hint_mask], dim=-1)  # (N, T*P², C+1)
+        hint_cond = self.hint_mlp(hint_input) * hint_mask                   # (N, T*P², pixel_hidden_dim)
+        hint_mod = self.hint_mod(hint_cond) * hint_mask                     # (N, T*P², 6*pixel_hidden_dim)
+
+        # Embed noised input pixels directly as pixel tokens (PixelDiT-style)
+        pixel_tokens = self.patchify_to_pixels(x_noised)            # (N, T*P², C)
+        pixel_tokens = self.pixel_embed(pixel_tokens)               # (N, T*P², pixel_hidden_dim)
+
+        # Pixel-level refinement blocks with per-block semantic adaLN (PixelDiT Sec 3.2)
+        for pblock in self.pixel_blocks:
+            pixel_tokens = pblock(pixel_tokens, x, hint_mod)
+
+        # Output projection
+        pixel_tokens = self.pixel_norm_out(pixel_tokens)
+        pixel_tokens = self.pixel_out(pixel_tokens)                  # (N, T*P², out_channels)
+        pixel_tokens = pixel_tokens.reshape(N, T, P2 * self.out_channels)  # (N, T, P²*C)
+        output = self.unpatchify(pixel_tokens, self.patch_size)
 
         return output
 

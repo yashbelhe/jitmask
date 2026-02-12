@@ -15,6 +15,10 @@ class Denoiser(nn.Module):
             num_classes=args.class_num,
             attn_drop=args.attn_dropout,
             proj_drop=args.proj_dropout,
+            pixel_hidden_dim=args.pixel_hidden_dim,
+            num_pixel_blocks=args.num_pixel_blocks,
+            pixel_num_heads=args.pixel_num_heads,
+            ptc_rate=args.ptc_rate,
         )
         self.img_size = args.img_size
         self.num_classes = args.class_num
@@ -31,6 +35,10 @@ class Denoiser(nn.Module):
         self.ema_params1 = None
         self.ema_params2 = None
 
+        # pixel hint conditioning
+        self.p_hint = args.p_hint
+        self.hint_loss_weight = args.hint_loss_weight
+
         # generation hyper params
         self.method = args.sampling_method
         self.steps = args.num_sampling_steps
@@ -41,6 +49,20 @@ class Denoiser(nn.Module):
         drop = torch.rand(labels.shape[0], device=labels.device) < self.label_drop_prob
         out = torch.where(drop, torch.full_like(labels, self.num_classes), labels)
         return out
+
+    def patchify_pixels(self, imgs):
+        """
+        Patchify image into per-pixel tokens (inverse of unpatchify).
+        imgs: (N, C, H, W)
+        returns: (N, T*P*P, C) where T = (H/P)*(W/P)
+        """
+        p = self.net.patch_size
+        N, C, H, W = imgs.shape
+        h, w = H // p, W // p
+        x = imgs.reshape(N, C, h, p, w, p)
+        x = x.permute(0, 2, 4, 3, 5, 1)  # (N, h, w, p, p, C)
+        x = x.reshape(N, h * w * p * p, C)
+        return x
 
     def sample_t(self, n: int, device=None):
         z = torch.randn(n, device=device) * self.P_std + self.P_mean
@@ -55,20 +77,29 @@ class Denoiser(nn.Module):
         z = t * x + (1 - t) * e
         v = (x - z) / (1 - t).clamp_min(self.t_eps)
 
-        x_pred = self.net(z, t.flatten(), labels_dropped)
+        # Prepare GT pixel hints for conditioning
+        N, C, H, W = x.shape
+        hint_mask_img = (torch.rand(N, 1, H, W, device=x.device) < self.p_hint).float()  # (N, 1, H, W)
+        gt_pixels = self.patchify_pixels(x)                           # (N, T*P², 3)
+        hint_mask = self.patchify_pixels(hint_mask_img)               # (N, T*P², 1)
+
+        x_pred = self.net(z, t.flatten(), labels_dropped, gt_pixels=gt_pixels, hint_mask=hint_mask)
         v_pred = (x_pred - z) / (1 - t).clamp_min(self.t_eps)
 
-        # l2 loss
-        loss = (v - v_pred) ** 2
-        loss = loss.mean(dim=(1, 2, 3)).mean()
+        # Weighted l2 loss: lower weight for hinted (revealed) pixels
+        weight = torch.where(hint_mask_img > 0, self.hint_loss_weight, 1.0)  # (N, 1, H, W)
+        loss = ((v - v_pred) ** 2 * weight).mean()
 
         return loss
 
     @torch.no_grad()
-    def generate(self, labels):
+    def generate(self, labels, z_init=None):
         device = labels.device
         bsz = labels.size(0)
-        z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
+        if z_init is not None:
+            z = z_init.to(device)
+        else:
+            z = self.noise_scale * torch.randn(bsz, 3, self.img_size, self.img_size, device=device)
         timesteps = torch.linspace(0.0, 1.0, self.steps+1, device=device).view(-1, *([1] * z.ndim)).expand(-1, bsz, -1, -1, -1)
 
         if self.method == "euler":

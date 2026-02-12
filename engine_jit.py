@@ -64,6 +64,45 @@ def train_one_epoch(model, model_without_ddp, data_loader, optimizer, device, ep
                 log_writer.add_scalar('lr', lr, epoch_1000x)
 
 
+def save_samples(model_without_ddp, args, epoch, fixed_noise, fixed_labels):
+    """Save a 3x3 grid of generated samples to disk for visual tracking."""
+    if misc.get_rank() != 0:
+        return
+
+    model_without_ddp.eval()
+    save_dir = os.path.join(args.output_dir, "samples")
+    os.makedirs(save_dir, exist_ok=True)
+
+    # switch to ema params
+    model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+    ema_state_dict = copy.deepcopy(model_without_ddp.state_dict())
+    for i, (name, _value) in enumerate(model_without_ddp.named_parameters()):
+        ema_state_dict[name] = model_without_ddp.ema_params1[i]
+    model_without_ddp.load_state_dict(ema_state_dict)
+
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        sampled_images = model_without_ddp.generate(fixed_labels.cuda(), z_init=fixed_noise.cuda())
+
+    # denormalize [-1,1] -> [0,255] uint8
+    sampled_images = (sampled_images + 1) / 2
+    sampled_images = sampled_images.detach().cpu().numpy()
+    sampled_images = np.round(np.clip(sampled_images * 255, 0, 255)).astype(np.uint8)
+
+    # build 3x3 grid
+    _, C, H, W = sampled_images.shape
+    grid = np.zeros((H * 3, W * 3, C), dtype=np.uint8)
+    for idx in range(9):
+        r, c = idx // 3, idx % 3
+        grid[r * H:(r + 1) * H, c * W:(c + 1) * W] = sampled_images[idx].transpose(1, 2, 0)
+
+    grid_bgr = grid[:, :, ::-1]
+    cv2.imwrite(os.path.join(save_dir, "epoch_{:04d}.png".format(epoch)), grid_bgr)
+    print("Saved sample grid to {}/epoch_{:04d}.png".format(save_dir, epoch))
+
+    # back to no ema
+    model_without_ddp.load_state_dict(model_state_dict)
+
+
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
 
     model_without_ddp.eval()

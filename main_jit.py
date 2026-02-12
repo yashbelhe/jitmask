@@ -15,11 +15,11 @@ from util.crop import center_crop_arr
 import util.misc as misc
 
 import copy
-from engine_jit import train_one_epoch, evaluate
+from engine_jit import train_one_epoch, evaluate, save_samples
 
 from denoiser import Denoiser
 
-
+torch.set_float32_matmul_precision('high')
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
 
@@ -55,6 +55,18 @@ def get_args_parser():
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
+    parser.add_argument('--p_hint', default=0.25, type=float,
+                        help='Fraction of pixels per patch revealed as GT hints during training')
+    parser.add_argument('--hint_loss_weight', default=0.1, type=float,
+                        help='Loss weight for hinted (revealed) pixels (masked pixels get weight 1.0)')
+    parser.add_argument('--pixel_hidden_dim', default=16, type=int,
+                        help='Hidden dimension for pixel-level blocks (D_p in PixelDiT)')
+    parser.add_argument('--num_pixel_blocks', default=3, type=int,
+                        help='Number of pixel transformer blocks (M in PixelDiT)')
+    parser.add_argument('--pixel_num_heads', default=4, type=int,
+                        help='Number of attention heads in pixel transformer blocks')
+    parser.add_argument('--ptc_rate', default=16, type=int,
+                        help='Pixel Token Compaction rate (r in PixelDiT, default 16 for P=16)')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -218,6 +230,11 @@ def main(args):
                 evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
         return
 
+    # Fixed noise and labels for consistent sample visualization (3x3 grid)
+    sample_rng = torch.Generator().manual_seed(42)
+    fixed_noise = torch.randn(9, 3, args.img_size, args.img_size, generator=sample_rng) * args.noise_scale
+    fixed_labels = torch.linspace(0, args.class_num - 1, 9).long()
+
     # Training loop
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
@@ -244,6 +261,12 @@ def main(args):
                 optimizer=optimizer,
                 epoch=epoch
             )
+
+        # Save fixed sample grid for visual tracking (every epoch)
+        torch.cuda.empty_cache()
+        with torch.no_grad():
+            save_samples(model_without_ddp, args, epoch, fixed_noise, fixed_labels)
+        torch.cuda.empty_cache()
 
         # Perform online evaluation at specified intervals
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
