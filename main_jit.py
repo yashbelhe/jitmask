@@ -20,6 +20,8 @@ from engine_jit import train_one_epoch, evaluate, save_samples
 from denoiser import Denoiser
 
 torch.set_float32_matmul_precision('high')
+
+
 def get_args_parser():
     parser = argparse.ArgumentParser('JiT', add_help=False)
 
@@ -29,6 +31,11 @@ def get_args_parser():
     parser.add_argument('--img_size', default=256, type=int, help='Image size')
     parser.add_argument('--attn_dropout', type=float, default=0.0, help='Attention dropout rate')
     parser.add_argument('--proj_dropout', type=float, default=0.0, help='Projection dropout rate')
+    parser.add_argument('--pixel_hidden_dim', default=16, type=int,
+                        help='Hidden dimension for pixel-level blocks (D_pix in PixelDiT)')
+    parser.add_argument('--num_pixel_blocks', default=4, type=int,
+                        help='Number of pixel transformer blocks (M in PixelDiT). '
+                             'PixelDiT: B=2, L=4, XL=4. Default 4 matches L/XL.')
 
     # training
     parser.add_argument('--epochs', default=200, type=int)
@@ -37,36 +44,51 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=128, type=int,
                         help='Batch size per GPU (effective batch size = batch_size * # GPUs)')
     parser.add_argument('--lr', type=float, default=None, metavar='LR',
-                        help='Learning rate (absolute)')
-    parser.add_argument('--blr', type=float, default=5e-5, metavar='LR',
+                        help='Learning rate (absolute lr)')
+    parser.add_argument('--blr', type=float, default=1e-4, metavar='LR',
                         help='Base learning rate: absolute_lr = base_lr * total_batch_size / 256')
     parser.add_argument('--min_lr', type=float, default=0., metavar='LR',
-                        help='Minimum LR for cyclic schedulers that hit 0')
+                        help='Minimum LR for cyclic schedulers')
     parser.add_argument('--lr_schedule', type=str, default='constant',
-                        help='Learning rate schedule')
+                        help='Learning rate schedule (constant | cosine | step). '
+                             'Use "step" to replicate PixelDiT two-phase training.')
+    parser.add_argument('--lr_step_epoch', type=int, default=160,
+                        help='Epoch at which to step down the LR (used with --lr_schedule step). '
+                             'PixelDiT: 160 for 320-epoch training.')
+    parser.add_argument('--lr_after_step', type=float, default=1e-5,
+                        help='LR value after step-down (used with --lr_schedule step). '
+                             'PixelDiT: 1e-5.')
     parser.add_argument('--weight_decay', type=float, default=0.0,
                         help='Weight decay (default: 0.0)')
+    parser.add_argument('--clip_grad', type=float, default=1.0,
+                        help='Gradient clipping max norm (0 to disable)')
     parser.add_argument('--ema_decay1', type=float, default=0.9999,
-                        help='The first ema to track. Use the first ema for sampling by default.')
+                        help='First EMA decay (used for sampling by default)')
     parser.add_argument('--ema_decay2', type=float, default=0.9996,
-                        help='The second ema to track')
-    parser.add_argument('--P_mean', default=-0.8, type=float)
-    parser.add_argument('--P_std', default=0.8, type=float)
+                        help='Second EMA decay')
+    # Logit-normal timestep sampling (PixelDiT / SD3 convention: loc=0, scale=1)
+    parser.add_argument('--P_mean', default=0.0, type=float,
+                        help='Mean of the logit-normal timestep distribution')
+    parser.add_argument('--P_std', default=1.0, type=float,
+                        help='Std of the logit-normal timestep distribution')
     parser.add_argument('--noise_scale', default=1.0, type=float)
     parser.add_argument('--t_eps', default=5e-2, type=float)
     parser.add_argument('--label_drop_prob', default=0.1, type=float)
     parser.add_argument('--p_hint', default=0.25, type=float,
                         help='Fraction of pixels per patch revealed as GT hints during training')
     parser.add_argument('--hint_loss_weight', default=0.1, type=float,
-                        help='Loss weight for hinted (revealed) pixels (masked pixels get weight 1.0)')
-    parser.add_argument('--pixel_hidden_dim', default=16, type=int,
-                        help='Hidden dimension for pixel-level blocks (D_p in PixelDiT)')
-    parser.add_argument('--num_pixel_blocks', default=3, type=int,
-                        help='Number of pixel transformer blocks (M in PixelDiT)')
-    parser.add_argument('--pixel_num_heads', default=4, type=int,
-                        help='Number of attention heads in pixel transformer blocks')
-    parser.add_argument('--ptc_rate', default=16, type=int,
-                        help='Pixel Token Compaction rate (r in PixelDiT, default 16 for P=16)')
+                        help='Loss weight for hinted (revealed) pixels (masked pixels get 1.0)')
+
+    # REPA alignment
+    parser.add_argument('--repa_coeff', default=0.5, type=float,
+                        help='Weight for REPA alignment loss (0 to disable REPA + DINOv2 entirely)')
+    parser.add_argument('--repa_depth', default=8, type=int,
+                        help='Patch-level block index at which to extract features for REPA')
+    parser.add_argument('--repa_proj_dim', default=768, type=int,
+                        help='DINOv2 feature dimension for REPA projector (768 for ViT-B)')
+    parser.add_argument('--repa_bf16', action='store_true',
+                        help='Compute REPA cosine similarity in bfloat16 (default: float32). '
+                             'Use to benchmark whether fp32 REPA is the throughput bottleneck.')
 
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--start_epoch', default=0, type=int, metavar='N',
@@ -79,17 +101,17 @@ def get_args_parser():
 
     # sampling
     parser.add_argument('--sampling_method', default='heun', type=str,
-                        help='ODE samping method')
+                        help='ODE sampling method (euler | heun)')
     parser.add_argument('--num_sampling_steps', default=50, type=int,
-                        help='Sampling steps')
+                        help='Number of ODE sampling steps')
     parser.add_argument('--cfg', default=1.0, type=float,
-                        help='Classifier-free guidance factor')
+                        help='Classifier-free guidance scale')
     parser.add_argument('--interval_min', default=0.0, type=float,
                         help='CFG interval min')
     parser.add_argument('--interval_max', default=1.0, type=float,
                         help='CFG interval max')
     parser.add_argument('--num_images', default=50000, type=int,
-                        help='Number of images to generate')
+                        help='Number of images to generate for evaluation')
     parser.add_argument('--eval_freq', type=int, default=40,
                         help='Frequency (in epochs) for evaluation')
     parser.add_argument('--online_eval', action='store_true')
@@ -124,6 +146,22 @@ def get_args_parser():
     return parser
 
 
+def load_dino_encoder(device):
+    """Load frozen DINOv2-ViT-B/14 encoder for REPA alignment via timm.
+    Uses timm instead of torch.hub to avoid Python 3.10+ union-type syntax
+    incompatibility in the cached DINOv2 hub code."""
+    import timm
+    print("Loading DINOv2-ViT-B/14 encoder for REPA (via timm)...")
+    encoder = timm.create_model('vit_base_patch14_dinov2', pretrained=True, num_classes=0, dynamic_img_size=True)
+    encoder.eval()
+    for p in encoder.parameters():
+        p.requires_grad_(False)
+    encoder = encoder.to(device)
+    encoder = torch.compile(encoder)
+    print(f"DINOv2 loaded. Embed dim: {encoder.num_features}")
+    return encoder
+
+
 def main(args):
     misc.init_distributed_mode(args)
     print('Job directory:', os.path.dirname(os.path.realpath(__file__)))
@@ -131,17 +169,15 @@ def main(args):
 
     device = torch.device(args.device)
 
-    # Set seeds for reproducibility
     seed = args.seed + misc.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
 
     cudnn.benchmark = True
 
-    num_tasks = misc.get_world_size()
+    num_tasks   = misc.get_world_size()
     global_rank = misc.get_rank()
 
-    # Set up TensorBoard logging (only on main process)
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
         log_writer = SummaryWriter(log_dir=args.output_dir)
@@ -174,6 +210,11 @@ def main(args):
     torch._dynamo.config.cache_size_limit = 128
     torch._dynamo.config.optimize_ddp = False
 
+    # Load DINOv2 encoder for REPA (frozen, not wrapped in DDP)
+    dino_encoder = None
+    if args.repa_coeff > 0:
+        dino_encoder = load_dino_encoder(device)
+
     # Create denoiser
     model = Denoiser(args)
 
@@ -182,9 +223,10 @@ def main(args):
     print("Number of trainable parameters: {:.6f}M".format(n_params / 1e6))
 
     model.to(device)
+    model = torch.compile(model)
 
     eff_batch_size = args.batch_size * misc.get_world_size()
-    if args.lr is None:  # only base_lr (blr) is specified
+    if args.lr is None:
         args.lr = args.blr * eff_batch_size / 256
 
     print("Base lr: {:.2e}".format(args.lr * 256 / eff_batch_size))
@@ -194,9 +236,9 @@ def main(args):
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
     model_without_ddp = model.module
 
-    # Set up optimizer with weight decay adjustment for bias and norm layers
     param_groups = misc.add_weight_decay(model_without_ddp, args.weight_decay)
-    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
+    # PixelDiT: AdamW with betas=(0.9, 0.999)
+    optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.999))
     print(optimizer)
 
     # Resume from checkpoint if provided
@@ -214,7 +256,7 @@ def main(args):
         if 'optimizer' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             args.start_epoch = checkpoint['epoch'] + 1
-            print("Loaded optimizer & scaler state!")
+            print("Loaded optimizer state!")
         del checkpoint
     else:
         model_without_ddp.ema_params1 = copy.deepcopy(list(model_without_ddp.parameters()))
@@ -230,21 +272,22 @@ def main(args):
                 evaluate(model_without_ddp, args, 0, batch_size=args.gen_bsz, log_writer=log_writer)
         return
 
-    # Fixed noise and labels for consistent sample visualization (3x3 grid)
+    # Fixed noise and labels for consistent sample visualization
     sample_rng = torch.Generator().manual_seed(42)
     fixed_noise = torch.randn(9, 3, args.img_size, args.img_size, generator=sample_rng) * args.noise_scale
     fixed_labels = torch.linspace(0, args.class_num - 1, 9).long()
 
-    # Training loop
     print(f"Start training for {args.epochs} epochs")
     start_time = time.time()
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
 
-        train_one_epoch(model, model_without_ddp, data_loader_train, optimizer, device, epoch, log_writer=log_writer, args=args)
+        train_one_epoch(
+            model, model_without_ddp, data_loader_train, optimizer, device, epoch,
+            log_writer=log_writer, args=args, dino_encoder=dino_encoder,
+        )
 
-        # Save checkpoint periodically
         if epoch % args.save_last_freq == 0 or epoch + 1 == args.epochs:
             misc.save_model(
                 args=args,
@@ -262,13 +305,11 @@ def main(args):
                 epoch=epoch
             )
 
-        # Save fixed sample grid for visual tracking (every epoch)
         torch.cuda.empty_cache()
         with torch.no_grad():
             save_samples(model_without_ddp, args, epoch, fixed_noise, fixed_labels)
         torch.cuda.empty_cache()
 
-        # Perform online evaluation at specified intervals
         if args.online_eval and (epoch % args.eval_freq == 0 or epoch + 1 == args.epochs):
             torch.cuda.empty_cache()
             with torch.no_grad():
