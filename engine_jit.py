@@ -11,7 +11,21 @@ import cv2
 import util.misc as misc
 import util.lr_sched as lr_sched
 import torch_fidelity
-import copy
+
+
+def _swap_to_ema(model_without_ddp):
+    """Copy EMA params into model in-place; return saved training param data."""
+    params = list(model_without_ddp.parameters())
+    saved = [p.data.clone() for p in params]
+    for p, ema in zip(params, model_without_ddp.ema_params1):
+        p.data.copy_(ema.data)
+    return saved
+
+
+def _swap_to_train(model_without_ddp, saved):
+    """Restore training params in-place from saved data."""
+    for p, data in zip(model_without_ddp.parameters(), saved):
+        p.data.copy_(data)
 
 
 # ImageNet normalization constants for DINOv2 preprocessing
@@ -118,15 +132,10 @@ def save_samples(model_without_ddp, args, epoch, fixed_noise, fixed_labels):
     save_dir = os.path.join(args.output_dir, "samples")
     os.makedirs(save_dir, exist_ok=True)
 
-    # Switch to EMA params
-    model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-    ema_state_dict   = copy.deepcopy(model_without_ddp.state_dict())
-    for i, (name, _) in enumerate(model_without_ddp.named_parameters()):
-        ema_state_dict[name] = model_without_ddp.ema_params1[i]
-    model_without_ddp.load_state_dict(ema_state_dict)
-
+    saved = _swap_to_ema(model_without_ddp)
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
         sampled_images = model_without_ddp.generate(fixed_labels.cuda(), z_init=fixed_noise.cuda())
+    _swap_to_train(model_without_ddp, saved)
 
     # Denormalize [-1,1] → [0,255] uint8
     sampled_images = (sampled_images + 1) / 2
@@ -141,9 +150,6 @@ def save_samples(model_without_ddp, args, epoch, fixed_noise, fixed_labels):
 
     cv2.imwrite(os.path.join(save_dir, "epoch_{:04d}.png".format(epoch)), grid[:, :, ::-1])
     print("Saved sample grid to {}/epoch_{:04d}.png".format(save_dir, epoch))
-
-    # Restore non-EMA params
-    model_without_ddp.load_state_dict(model_state_dict)
 
 
 def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
@@ -166,13 +172,8 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
         os.makedirs(save_folder)
 
     # Switch to EMA params
-    model_state_dict = copy.deepcopy(model_without_ddp.state_dict())
-    ema_state_dict   = copy.deepcopy(model_without_ddp.state_dict())
-    for i, (name, _) in enumerate(model_without_ddp.named_parameters()):
-        assert name in ema_state_dict
-        ema_state_dict[name] = model_without_ddp.ema_params1[i]
     print("Switch to ema")
-    model_without_ddp.load_state_dict(ema_state_dict)
+    saved = _swap_to_ema(model_without_ddp)
 
     class_num = args.class_num
     assert args.num_images % class_num == 0, "Number of images per class must be the same"
@@ -206,7 +207,7 @@ def evaluate(model_without_ddp, args, epoch, batch_size=64, log_writer=None):
     torch.distributed.barrier()
 
     print("Switch back from ema")
-    model_without_ddp.load_state_dict(model_state_dict)
+    _swap_to_train(model_without_ddp, saved)
 
     if log_writer is not None:
         if args.img_size == 256:
